@@ -6,8 +6,9 @@ use axum::http::StatusCode;
 use tracing::{error, instrument};
 
 use kiwi_mail_types::{
-    KiwiErrorBody, KiwiErrorResponse, KiwiResponse, MailFormat, MailReadQuery, MailSearchRequest,
-    MailSendRequest, MailSendResponse, ResponseMeta,
+    KiwiErrorBody, KiwiErrorResponse, KiwiResponse, MailDeleteResponse, MailFormat, MailMoveRequest,
+    MailMoveResponse, MailReadQuery, MailSearchRequest, MailSendRequest, MailSendResponse,
+    MailUpdateRequest, MailUpdateResponse, Mailbox, ResponseMeta,
 };
 
 use crate::AppState;
@@ -118,7 +119,16 @@ pub async fn send(
 ) -> ApiResult<MailSendResponse> {
     let id = state
         .jmap
-        .email_send(&req.to, &req.subject, &req.body, &req.cc, &req.bcc)
+        .email_send(
+            &req.to,
+            &req.subject,
+            &req.body,
+            &req.cc,
+            &req.bcc,
+            req.in_reply_to.as_deref(),
+            req.references.as_deref(),
+            &req.format,
+        )
         .await
         .map_err(|e| {
             error!(error = %e, "mail send failed");
@@ -130,6 +140,90 @@ pub async fn send(
             id,
             status: "sent".to_string(),
         },
+        meta: meta(),
+    }))
+}
+
+#[instrument(skip(state))]
+pub async fn list_mailboxes(
+    State(state): State<Arc<AppState>>,
+) -> ApiResult<Vec<Mailbox>> {
+    let mailboxes = state
+        .jmap
+        .mailbox_list()
+        .await
+        .map_err(|e| {
+            error!(error = %e, "mailbox list failed");
+            api_error(StatusCode::BAD_GATEWAY, "upstream_error", &e.to_string())
+        })?;
+
+    Ok(Json(KiwiResponse {
+        data: mailboxes,
+        meta: meta(),
+    }))
+}
+
+#[instrument(skip(state))]
+pub async fn move_email(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<MailMoveRequest>,
+) -> ApiResult<MailMoveResponse> {
+    state
+        .jmap
+        .email_move(&id, &req.mailbox_id)
+        .await
+        .map_err(|e| {
+            error!(error = %e, "mail move failed");
+            api_error(StatusCode::BAD_GATEWAY, "upstream_error", &e.to_string())
+        })?;
+
+    Ok(Json(KiwiResponse {
+        data: MailMoveResponse {
+            id,
+            mailbox_id: req.mailbox_id,
+        },
+        meta: meta(),
+    }))
+}
+
+#[instrument(skip(state))]
+pub async fn delete_email(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> ApiResult<MailDeleteResponse> {
+    let status = state
+        .jmap
+        .email_delete(&id)
+        .await
+        .map_err(|e| {
+            error!(error = %e, "mail delete failed");
+            api_error(StatusCode::BAD_GATEWAY, "upstream_error", &e.to_string())
+        })?;
+
+    Ok(Json(KiwiResponse {
+        data: MailDeleteResponse { id, status },
+        meta: meta(),
+    }))
+}
+
+#[instrument(skip(state))]
+pub async fn update_email(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<MailUpdateRequest>,
+) -> ApiResult<MailUpdateResponse> {
+    state
+        .jmap
+        .email_update_keywords(&id, req.is_read, req.is_flagged)
+        .await
+        .map_err(|e| {
+            error!(error = %e, "mail update failed");
+            api_error(StatusCode::BAD_GATEWAY, "upstream_error", &e.to_string())
+        })?;
+
+    Ok(Json(KiwiResponse {
+        data: MailUpdateResponse { id },
         meta: meta(),
     }))
 }

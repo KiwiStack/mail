@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{debug, instrument};
 
-use kiwi_mail_types::{Address, Attachment, EmailDetail, EmailSummary};
+use kiwi_mail_types::{Address, Attachment, EmailDetail, EmailSummary, Mailbox, SendFormat};
 
 #[derive(Debug, thiserror::Error)]
 pub enum JmapError {
@@ -27,6 +27,7 @@ pub struct JmapClient {
     endpoint: String,
     account_id: String,
     drafts_mailbox_id: Option<String>,
+    trash_mailbox_id: Option<String>,
     admin_user: String,
     admin_pass: String,
 }
@@ -74,13 +75,15 @@ impl JmapClient {
             endpoint,
             account_id,
             drafts_mailbox_id: None,
+            trash_mailbox_id: None,
             admin_user: admin_user.to_string(),
             admin_pass: admin_pass.to_string(),
         };
 
-        // Discover drafts mailbox
+        // Discover special mailboxes
         client.drafts_mailbox_id = client.find_mailbox_by_role("drafts").await.ok().flatten();
-        debug!(drafts = ?client.drafts_mailbox_id, "mailbox discovery complete");
+        client.trash_mailbox_id = client.find_mailbox_by_role("trash").await.ok().flatten();
+        debug!(drafts = ?client.drafts_mailbox_id, trash = ?client.trash_mailbox_id, "mailbox discovery complete");
 
         Ok(client)
     }
@@ -173,7 +176,7 @@ impl JmapClient {
                             "name": "Email/query",
                             "path": "/ids"
                         },
-                        "properties": ["id", "from", "to", "subject", "receivedAt", "preview"],
+                        "properties": ["id", "from", "to", "subject", "receivedAt", "preview", "keywords"],
                     }),
                     "g0".into(),
                 ),
@@ -202,7 +205,8 @@ impl JmapClient {
             "ids": [id],
             "properties": [
                 "id", "from", "to", "cc", "subject", "receivedAt",
-                "textBody", "htmlBody", "attachments", "bodyValues"
+                "textBody", "htmlBody", "attachments", "bodyValues",
+                "messageId", "inReplyTo", "keywords"
             ],
         });
 
@@ -239,6 +243,9 @@ impl JmapClient {
         body: &str,
         cc: &[String],
         bcc: &[String],
+        in_reply_to: Option<&str>,
+        references: Option<&str>,
+        format: &SendFormat,
     ) -> Result<String> {
         // Build mailboxIds — use drafts if discovered, otherwise empty (let server default)
         let mailbox_ids = if let Some(ref drafts_id) = self.drafts_mailbox_id {
@@ -247,6 +254,8 @@ impl JmapClient {
             json!({})
         };
 
+        let is_html = matches!(format, SendFormat::Html);
+
         let mut email = json!({
             "to": to.iter().map(|a| json!({"email": a})).collect::<Vec<_>>(),
             "subject": subject,
@@ -254,14 +263,25 @@ impl JmapClient {
             "bodyValues": {
                 "body": { "value": body, "charset": "utf-8" }
             },
-            "textBody": [{ "partId": "body", "type": "text/plain" }],
         });
+
+        if is_html {
+            email["htmlBody"] = json!([{ "partId": "body", "type": "text/html" }]);
+        } else {
+            email["textBody"] = json!([{ "partId": "body", "type": "text/plain" }]);
+        }
 
         if !cc.is_empty() {
             email["cc"] = json!(cc.iter().map(|a| json!({"email": a})).collect::<Vec<_>>());
         }
         if !bcc.is_empty() {
             email["bcc"] = json!(bcc.iter().map(|a| json!({"email": a})).collect::<Vec<_>>());
+        }
+        if let Some(irt) = in_reply_to {
+            email["inReplyTo"] = json!([irt]);
+        }
+        if let Some(refs) = references {
+            email["references"] = json!(refs.split_whitespace().collect::<Vec<_>>());
         }
 
         let create_id = "draft1";
@@ -309,6 +329,188 @@ impl JmapClient {
         Err(JmapError::UnexpectedResponse(
             "no email ID in Email/set response".into(),
         ))
+    }
+
+    #[instrument(skip(self))]
+    pub async fn mailbox_list(&self) -> Result<Vec<Mailbox>> {
+        let resp = self
+            .call(vec![(
+                "Mailbox/get".into(),
+                json!({
+                    "accountId": self.account_id,
+                    "properties": ["id", "name", "role", "totalEmails", "unreadEmails"],
+                }),
+                "m0".into(),
+            )])
+            .await?;
+
+        for (method, result, _) in &resp.method_responses {
+            if method == "Mailbox/get" {
+                if let Some(list) = result.get("list").and_then(|l| l.as_array()) {
+                    return Ok(list.iter().filter_map(parse_mailbox).collect());
+                }
+            }
+        }
+
+        Ok(vec![])
+    }
+
+    #[instrument(skip(self))]
+    pub async fn email_move(&self, id: &str, mailbox_id: &str) -> Result<()> {
+        let resp = self
+            .call(vec![(
+                "Email/set".into(),
+                json!({
+                    "accountId": self.account_id,
+                    "update": {
+                        id: {
+                            "mailboxIds": { mailbox_id: true }
+                        }
+                    }
+                }),
+                "u0".into(),
+            )])
+            .await?;
+
+        for (method, result, _) in &resp.method_responses {
+            if method == "Email/set" {
+                if let Some(not_updated) = result.get("notUpdated").and_then(|n| n.get(id)) {
+                    return Err(JmapError::Protocol(format!(
+                        "failed to move email: {not_updated}"
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[instrument(skip(self))]
+    pub async fn email_delete(&self, id: &str) -> Result<String> {
+        // Check if email is already in trash — if so, destroy permanently
+        // Otherwise, move to trash
+        if let Some(ref trash_id) = self.trash_mailbox_id {
+            // First check if the email is in trash
+            let check_resp = self
+                .call(vec![(
+                    "Email/get".into(),
+                    json!({
+                        "accountId": self.account_id,
+                        "ids": [id],
+                        "properties": ["mailboxIds"],
+                    }),
+                    "c0".into(),
+                )])
+                .await?;
+
+            let mut in_trash = false;
+            for (method, result, _) in &check_resp.method_responses {
+                if method == "Email/get" {
+                    if let Some(list) = result.get("list").and_then(|l| l.as_array()) {
+                        if let Some(email) = list.first() {
+                            if let Some(mbox_ids) = email.get("mailboxIds") {
+                                in_trash = mbox_ids.get(trash_id).is_some();
+                            }
+                        }
+                    }
+                }
+            }
+
+            if in_trash {
+                // Permanently destroy
+                let resp = self
+                    .call(vec![(
+                        "Email/set".into(),
+                        json!({
+                            "accountId": self.account_id,
+                            "destroy": [id],
+                        }),
+                        "d0".into(),
+                    )])
+                    .await?;
+
+                for (method, result, _) in &resp.method_responses {
+                    if method == "Email/set" {
+                        if let Some(not_destroyed) =
+                            result.get("notDestroyed").and_then(|n| n.get(id))
+                        {
+                            return Err(JmapError::Protocol(format!(
+                                "failed to destroy email: {not_destroyed}"
+                            )));
+                        }
+                    }
+                }
+
+                return Ok("destroyed".to_string());
+            }
+
+            // Move to trash
+            self.email_move(id, trash_id).await?;
+            return Ok("trashed".to_string());
+        }
+
+        // No trash mailbox found — destroy permanently
+        let resp = self
+            .call(vec![(
+                "Email/set".into(),
+                json!({
+                    "accountId": self.account_id,
+                    "destroy": [id],
+                }),
+                "d0".into(),
+            )])
+            .await?;
+
+        for (method, result, _) in &resp.method_responses {
+            if method == "Email/set" {
+                if let Some(not_destroyed) = result.get("notDestroyed").and_then(|n| n.get(id)) {
+                    return Err(JmapError::Protocol(format!(
+                        "failed to destroy email: {not_destroyed}"
+                    )));
+                }
+            }
+        }
+
+        Ok("destroyed".to_string())
+    }
+
+    #[instrument(skip(self))]
+    pub async fn email_update_keywords(
+        &self,
+        id: &str,
+        is_read: Option<bool>,
+        is_flagged: Option<bool>,
+    ) -> Result<()> {
+        let mut update = json!({});
+        if let Some(read) = is_read {
+            update["keywords/$seen"] = json!(read);
+        }
+        if let Some(flagged) = is_flagged {
+            update["keywords/$flagged"] = json!(flagged);
+        }
+
+        let resp = self
+            .call(vec![(
+                "Email/set".into(),
+                json!({
+                    "accountId": self.account_id,
+                    "update": { id: update }
+                }),
+                "u0".into(),
+            )])
+            .await?;
+
+        for (method, result, _) in &resp.method_responses {
+            if method == "Email/set" {
+                if let Some(not_updated) = result.get("notUpdated").and_then(|n| n.get(id)) {
+                    return Err(JmapError::Protocol(format!(
+                        "failed to update email: {not_updated}"
+                    )));
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -362,7 +564,16 @@ fn parse_jmap_addresses(val: &Value) -> Vec<Address> {
         .unwrap_or_default()
 }
 
+fn parse_keywords(val: &Value) -> (bool, bool) {
+    let empty = json!({});
+    let keywords = val.get("keywords").unwrap_or(&empty);
+    let is_read = keywords.get("$seen").and_then(|v| v.as_bool()).unwrap_or(false);
+    let is_flagged = keywords.get("$flagged").and_then(|v| v.as_bool()).unwrap_or(false);
+    (is_read, is_flagged)
+}
+
 fn parse_email_summary(val: &Value) -> Option<EmailSummary> {
+    let (is_read, is_flagged) = parse_keywords(val);
     Some(EmailSummary {
         id: val.get("id")?.as_str()?.to_string(),
         from: parse_jmap_addresses(val.get("from").unwrap_or(&json!([]))),
@@ -382,6 +593,8 @@ fn parse_email_summary(val: &Value) -> Option<EmailSummary> {
             .and_then(|s| s.as_str())
             .unwrap_or("")
             .to_string(),
+        is_read,
+        is_flagged,
     })
 }
 
@@ -414,6 +627,20 @@ fn parse_email_detail(val: &Value, html: bool) -> EmailDetail {
         })
         .unwrap_or_default();
 
+    let message_id = val
+        .get("messageId")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    let in_reply_to = val
+        .get("inReplyTo")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
     EmailDetail {
         id: val
             .get("id")
@@ -435,7 +662,29 @@ fn parse_email_detail(val: &Value, html: bool) -> EmailDetail {
             .to_string(),
         body,
         attachments,
+        message_id,
+        in_reply_to,
     }
+}
+
+fn parse_mailbox(val: &Value) -> Option<Mailbox> {
+    Some(Mailbox {
+        id: val.get("id")?.as_str()?.to_string(),
+        name: val
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("")
+            .to_string(),
+        role: val.get("role").and_then(|r| r.as_str()).map(String::from),
+        total_emails: val
+            .get("totalEmails")
+            .and_then(|n| n.as_u64())
+            .unwrap_or(0),
+        unread_emails: val
+            .get("unreadEmails")
+            .and_then(|n| n.as_u64())
+            .unwrap_or(0),
+    })
 }
 
 fn extract_body_value(email: &Value, body_key: &str, body_values: &Value) -> String {

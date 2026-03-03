@@ -257,6 +257,7 @@ impl JmapClient {
         let is_html = matches!(format, SendFormat::Html);
 
         let mut email = json!({
+            "from": [{"email": self.admin_user}],
             "to": to.iter().map(|a| json!({"email": a})).collect::<Vec<_>>(),
             "subject": subject,
             "mailboxIds": mailbox_ids,

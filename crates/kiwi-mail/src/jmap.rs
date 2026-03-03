@@ -147,17 +147,21 @@ impl JmapClient {
     ) -> Result<Vec<EmailSummary>> {
         let filter = build_filter(query, mailbox, from, after, before);
 
+        let mut query_args = json!({
+            "accountId": self.account_id,
+            "sort": [{ "property": "receivedAt", "isAscending": false }],
+            "limit": limit,
+        });
+        if !filter.is_null() {
+            query_args["filter"] = filter;
+        }
+
         // Use back-reference: query first, then get with result reference
         let resp = self
             .call(vec![
                 (
                     "Email/query".into(),
-                    json!({
-                        "accountId": self.account_id,
-                        "filter": filter,
-                        "sort": [{ "property": "receivedAt", "isAscending": false }],
-                        "limit": limit,
-                    }),
+                    query_args,
                     "q0".into(),
                 ),
                 (
@@ -334,7 +338,7 @@ fn build_filter(
     }
 
     match conditions.len() {
-        0 => json!({}),
+        0 => Value::Null,
         1 => conditions.into_iter().next().unwrap(),
         _ => json!({
             "operator": "AND",

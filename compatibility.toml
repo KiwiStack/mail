@@ -1,0 +1,5 @@
+[upstream]
+name = "Stalwart Mail Server"
+version = "0.10.5"
+license = "AGPL-3.0"
+repository = "https://github.com/stalwartlabs/stalwart"

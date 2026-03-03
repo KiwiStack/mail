@@ -8,7 +8,7 @@ use tracing::{error, instrument};
 use kiwi_mail_types::{
     KiwiErrorBody, KiwiErrorResponse, KiwiResponse, MailDeleteResponse, MailFormat, MailMoveRequest,
     MailMoveResponse, MailReadQuery, MailSearchRequest, MailSendRequest, MailSendResponse,
-    MailUpdateRequest, MailUpdateResponse, Mailbox, ResponseMeta,
+    MailUpdateRequest, MailUpdateResponse, Mailbox, ResponseMeta, VacationResponse,
 };
 
 use crate::AppState;
@@ -75,6 +75,8 @@ pub async fn search(
             req.after.as_deref(),
             req.before.as_deref(),
             req.limit,
+            req.sort_by.as_deref(),
+            req.ascending,
         )
         .await
         .map_err(|e| {
@@ -224,6 +226,73 @@ pub async fn update_email(
 
     Ok(Json(KiwiResponse {
         data: MailUpdateResponse { id },
+        meta: meta(),
+    }))
+}
+
+#[instrument(skip(state))]
+pub async fn download_attachment(
+    State(state): State<Arc<AppState>>,
+    Path((email_id, blob_id)): Path<(String, String)>,
+) -> Result<(StatusCode, axum::http::HeaderMap, Vec<u8>), (StatusCode, Json<KiwiErrorResponse>)> {
+    let _ = email_id; // Used for routing context; blob_id is sufficient for JMAP
+    let bytes = state
+        .jmap
+        .attachment_download(&blob_id, "attachment")
+        .await
+        .map_err(|e| {
+            error!(error = %e, "attachment download failed");
+            api_error(StatusCode::BAD_GATEWAY, "upstream_error", &e.to_string())
+        })?;
+
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        "application/octet-stream".parse().unwrap(),
+    );
+    headers.insert(
+        axum::http::header::CONTENT_DISPOSITION,
+        format!("attachment; filename=\"attachment\"").parse().unwrap(),
+    );
+
+    Ok((StatusCode::OK, headers, bytes))
+}
+
+#[instrument(skip(state))]
+pub async fn get_vacation(
+    State(state): State<Arc<AppState>>,
+) -> ApiResult<VacationResponse> {
+    let vacation = state
+        .jmap
+        .vacation_get()
+        .await
+        .map_err(|e| {
+            error!(error = %e, "vacation get failed");
+            api_error(StatusCode::BAD_GATEWAY, "upstream_error", &e.to_string())
+        })?;
+
+    Ok(Json(KiwiResponse {
+        data: vacation,
+        meta: meta(),
+    }))
+}
+
+#[instrument(skip(state))]
+pub async fn set_vacation(
+    State(state): State<Arc<AppState>>,
+    Json(vacation): Json<VacationResponse>,
+) -> ApiResult<VacationResponse> {
+    state
+        .jmap
+        .vacation_set(&vacation)
+        .await
+        .map_err(|e| {
+            error!(error = %e, "vacation set failed");
+            api_error(StatusCode::BAD_GATEWAY, "upstream_error", &e.to_string())
+        })?;
+
+    Ok(Json(KiwiResponse {
+        data: vacation,
         meta: meta(),
     }))
 }

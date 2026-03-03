@@ -53,6 +53,10 @@ pub struct MailSearchRequest {
     pub before: Option<String>,
     #[serde(default = "default_limit")]
     pub limit: u32,
+    #[serde(default)]
+    pub sort_by: Option<String>,
+    #[serde(default)]
+    pub ascending: Option<bool>,
 }
 
 fn default_limit() -> u32 {
@@ -117,6 +121,8 @@ pub struct Attachment {
     pub size: u64,
     #[serde(rename = "type")]
     pub content_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_id: Option<String>,
 }
 
 // --- Mail send ---
@@ -212,6 +218,23 @@ pub struct MailDeleteResponse {
 pub struct HealthResponse {
     pub status: String,
     pub upstream: String,
+}
+
+// --- Vacation Response ---
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VacationResponse {
+    pub is_enabled: bool,
+    #[serde(default)]
+    pub from_date: Option<String>,
+    #[serde(default)]
+    pub to_date: Option<String>,
+    #[serde(default)]
+    pub subject: Option<String>,
+    #[serde(default)]
+    pub text_body: Option<String>,
+    #[serde(default)]
+    pub html_body: Option<String>,
 }
 
 // --- MCP Tools ---

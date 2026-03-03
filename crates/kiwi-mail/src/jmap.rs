@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{debug, instrument};
 
-use kiwi_mail_types::{Address, Attachment, EmailDetail, EmailSummary, Mailbox, SendFormat};
+use kiwi_mail_types::{Address, Attachment, EmailDetail, EmailSummary, Mailbox, SendFormat, VacationResponse};
 
 #[derive(Debug, thiserror::Error)]
 pub enum JmapError {
@@ -147,12 +147,17 @@ impl JmapClient {
         after: Option<&str>,
         before: Option<&str>,
         limit: u32,
+        sort_by: Option<&str>,
+        ascending: Option<bool>,
     ) -> Result<Vec<EmailSummary>> {
         let filter = build_filter(query, mailbox, from, after, before);
 
+        let sort_property = sort_by.unwrap_or("receivedAt");
+        let is_ascending = ascending.unwrap_or(false);
+
         let mut query_args = json!({
             "accountId": self.account_id,
-            "sort": [{ "property": "receivedAt", "isAscending": false }],
+            "sort": [{ "property": sort_property, "isAscending": is_ascending }],
             "limit": limit,
         });
         if !filter.is_null() {
@@ -513,6 +518,175 @@ impl JmapClient {
 
         Ok(())
     }
+
+    #[instrument(skip(self))]
+    pub async fn attachment_download(&self, blob_id: &str, name: &str) -> Result<Vec<u8>> {
+        let url = format!(
+            "{}/jmap/download/{}/{}/{}",
+            self.endpoint.trim_end_matches("/jmap"),
+            self.account_id,
+            blob_id,
+            name,
+        );
+        let bytes = self
+            .http
+            .get(&url)
+            .basic_auth(&self.admin_user, Some(&self.admin_pass))
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?;
+        Ok(bytes.to_vec())
+    }
+
+    #[instrument(skip(self))]
+    pub async fn vacation_get(&self) -> Result<VacationResponse> {
+        let resp = self
+            .call_with_capabilities(
+                vec![(
+                    "VacationResponse/get".into(),
+                    json!({
+                        "accountId": self.account_id,
+                        "ids": ["singleton"],
+                    }),
+                    "v0".into(),
+                )],
+                &[
+                    "urn:ietf:params:jmap:core",
+                    "urn:ietf:params:jmap:mail",
+                    "urn:ietf:params:jmap:vacationresponse",
+                ],
+            )
+            .await?;
+
+        for (method, result, _) in &resp.method_responses {
+            if method == "VacationResponse/get" {
+                if let Some(list) = result.get("list").and_then(|l| l.as_array()) {
+                    if let Some(vr) = list.first() {
+                        return Ok(VacationResponse {
+                            is_enabled: vr
+                                .get("isEnabled")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false),
+                            from_date: vr
+                                .get("fromDate")
+                                .and_then(|v| v.as_str())
+                                .map(String::from),
+                            to_date: vr
+                                .get("toDate")
+                                .and_then(|v| v.as_str())
+                                .map(String::from),
+                            subject: vr
+                                .get("subject")
+                                .and_then(|v| v.as_str())
+                                .map(String::from),
+                            text_body: vr
+                                .get("textBody")
+                                .and_then(|v| v.as_str())
+                                .map(String::from),
+                            html_body: vr
+                                .get("htmlBody")
+                                .and_then(|v| v.as_str())
+                                .map(String::from),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Default: not enabled
+        Ok(VacationResponse {
+            is_enabled: false,
+            from_date: None,
+            to_date: None,
+            subject: None,
+            text_body: None,
+            html_body: None,
+        })
+    }
+
+    #[instrument(skip(self))]
+    pub async fn vacation_set(&self, vacation: &VacationResponse) -> Result<()> {
+        let mut update = json!({
+            "isEnabled": vacation.is_enabled,
+        });
+        if let Some(ref from) = vacation.from_date {
+            update["fromDate"] = json!(from);
+        } else {
+            update["fromDate"] = Value::Null;
+        }
+        if let Some(ref to) = vacation.to_date {
+            update["toDate"] = json!(to);
+        } else {
+            update["toDate"] = Value::Null;
+        }
+        if let Some(ref subj) = vacation.subject {
+            update["subject"] = json!(subj);
+        }
+        if let Some(ref text) = vacation.text_body {
+            update["textBody"] = json!(text);
+        }
+        if let Some(ref html) = vacation.html_body {
+            update["htmlBody"] = json!(html);
+        }
+
+        let resp = self
+            .call_with_capabilities(
+                vec![(
+                    "VacationResponse/set".into(),
+                    json!({
+                        "accountId": self.account_id,
+                        "update": {
+                            "singleton": update
+                        }
+                    }),
+                    "v0".into(),
+                )],
+                &[
+                    "urn:ietf:params:jmap:core",
+                    "urn:ietf:params:jmap:mail",
+                    "urn:ietf:params:jmap:vacationresponse",
+                ],
+            )
+            .await?;
+
+        for (method, result, _) in &resp.method_responses {
+            if method == "VacationResponse/set" {
+                if let Some(not_updated) = result.get("notUpdated").and_then(|n| n.get("singleton"))
+                {
+                    return Err(JmapError::Protocol(format!(
+                        "failed to set vacation: {not_updated}"
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn call_with_capabilities(
+        &self,
+        method_calls: Vec<(String, Value, String)>,
+        capabilities: &[&'static str],
+    ) -> Result<JmapResponse> {
+        let req = JmapRequest {
+            using: capabilities.to_vec(),
+            method_calls,
+        };
+
+        let resp = self
+            .http
+            .post(&self.endpoint)
+            .basic_auth(&self.admin_user, Some(&self.admin_pass))
+            .json(&req)
+            .send()
+            .await?
+            .error_for_status()?;
+
+        let jmap_resp: JmapResponse = resp.json().await?;
+        Ok(jmap_resp)
+    }
 }
 
 fn build_filter(
@@ -623,6 +797,10 @@ fn parse_email_detail(val: &Value, html: bool) -> EmailDetail {
                         .and_then(|t| t.as_str())
                         .unwrap_or("application/octet-stream")
                         .to_string(),
+                    blob_id: a
+                        .get("blobId")
+                        .and_then(|b| b.as_str())
+                        .map(String::from),
                 })
                 .collect()
         })
